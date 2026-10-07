@@ -114,3 +114,67 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: SubSentry build ${{ github.run_number }}
           files: build/app/outputs/flutter-apk/app-release.apk
+
+      # ------------------------------------------------------------------
+      # LAUNCH TEST: starts the app on a virtual Android 11 phone and prints
+      # exactly why it crashed, if it does. It never blocks the APK above.
+      # Open the last step's log and read the text under "LAUNCH TEST RESULT".
+      # ------------------------------------------------------------------
+      - name: Build a copy for the virtual phone
+        continue-on-error: true
+        run: flutter build apk --release --target-platform android-x64
+
+      - name: Write launch-test script
+        run: |
+          cat > smoke.sh <<'SH'
+          #!/usr/bin/env bash
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          adb install -r "$APK" || { echo "LAUNCH TEST RESULT: could not install the test APK"; exit 0; }
+          PKG=$(adb shell pm list packages | grep -i subsentry | head -1 | cut -d: -f2 | tr -d '\r')
+          echo "Package: $PKG"
+          adb logcat -c
+          adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1
+          sleep 30
+          adb logcat -d -v time > logcat_full.txt
+          adb exec-out screencap -p > screenshot.png
+          echo ""
+          echo "=========== LAUNCH TEST RESULT ==========="
+          if adb shell pidof "$PKG" | grep -q '[0-9]'; then
+            echo "APP IS RUNNING: it started and did not crash on the virtual phone."
+          else
+            echo "APP IS NOT RUNNING: it crashed or closed. Details below."
+          fi
+          echo "----------- crash details -----------"
+          grep -n -A25 "FATAL EXCEPTION" logcat_full.txt | head -70
+          grep -n -A12 "Fatal signal" logcat_full.txt | head -40
+          grep -n -i "subsentry\|flutter" logcat_full.txt | grep -i " E/\| F/" | head -20
+          echo "=========================================="
+          exit 0
+          SH
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Launch test on virtual Android 11 phone
+        continue-on-error: true
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          script: bash smoke.sh
+
+      - name: Save launch-test files
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: launch-test
+          path: |
+            logcat_full.txt
+            screenshot.png
+          if-no-files-found: ignore
